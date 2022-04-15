@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "Control Server"
+
+Parameters:
+  ServerType:
+    Description: "Whether this just has permissions for app deploys, or full admin"
+    Type: String
+    Default: "control"
+    AllowedValues: 
+      - "control"
+      - "deploy"
+
+  NetworkStackName:
+    Description: "VPC CloudFormation stack name (used for imports)"
+    Type: String
+    Default: "vpc"
+
+  DomainStackName:
+    Description: "Hosted Zones stack name (used for imports)"
+    Type: String
+    Default: "hosted-zones"
+
+  ProfilesStackName:
+    Type: String
+    Default: "profiles"
+
+  HealthCheckGracePeriod:
+    Description: "The length of time in seconds after a new EC2 instance comes into service that Auto Scaling starts checking its health"
+    Default: 600
+    Type: Number
+    MinValue: "0"
+
+  KubernetesAMIVersion:
+    Type: String
+    Description: "*** UPDATE REQUIRES REPLACEMENT *** Version of Kubernetes image to use"
+    Default: "1x21"
+    AllowedValues: 
+      - "1x21"
+      - "1x19"
+
+  EksName:
+    Type: String
+    Description: "The EKS cluster to issue kubectl commands to"
+    Default: "eks-virginia"
+
+# ********************************
+# ********************************
+
+  EC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "***REQUIRED*** KeyPair for generating EC2 instances"
+    Default: dcprod
+
+  InstanceType:
+    Type: String
+    Description: "The size of the EC2 instance"
+    Default: "t3.medium"
+    AllowedValues:
+      - t3.medium
+      - m5.large
+
+Mappings:
+
+  EKSOptimizedAMIbyRegion:
+  # The current list of EKS-Optimized images is at:
+  # https://amazon-eks.s3-us-east-1.amazonaws.com/cloudformation/2018-08-30/amazon-eks-nodegroup.yaml
+    us-east-1:
+      "1x21":          "ami-0736de2bd43b193bf"
+      "1x19":          "ami-0ab55b95f0cdf8d7d"
+    us-west-2:
+      "1x21":          "ami-004670f3ff371d668"
+      "1x19":          "ami-05bca53592a12ed6d"
+
+Conditions:
+  IsControl:
+    !Equals [!Ref ServerType, control]
+
+Resources:
+
+  EC2forControl:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          general:
+            - config-image
+          session-manager:
+            - connect
+
+        config-image:
+          commands:
+            01-schedule-docker-cleanup:
+              command: |
+                echo
+                echo "--- Set up 4 am docker prune job"
+                touch /var/log/docker-prune.out
+                chown ec2-user:ec2-user /var/log/docker-prune.out
+                echo "
+                PATH=/usr/local/bin:/usr/bin:/bin
+                00 04 * * * docker system prune --all -f >> /var/log/docker-prune.out 2>&1
+                " | /usr/bin/crontab - -u ec2-user
+            02-attach-ebs:
+              command: !Sub |
+                echo fetching volume variables >> /var/log/volume-mount.log
+                VOLUME_ID=$(aws ec2 describe-volumes --filters Name=tag:Name,Values=${ServerType}-ebs | jq -r '.Volumes[].VolumeId')
+                echo VOLUME_ID $VOLUME_ID >> /var/log/volume-mount.log
+                INSTANCE_ID=$(curl http://instance-data/latest/meta-data/instance-id)
+                echo INSTANCE_ID $INSTANCE_ID >> /var/log/volume-mount.log
+                DEVICE_NAME=/dev/xvdh
+                MOUNT_POINT=/mnt/config
+                FS_FORMAT=ext4
+                echo attaching volume >> /var/log/volume-mount.log
+                aws ec2 attach-volume --volume-id $VOLUME_ID --instance-id $INSTANCE_ID --device $DEVICE_NAME
+                echo waiting for attachment >> /var/log/volume-mount.log
+                # Wait for volume to mount
+                while file -s $DEVICE_NAME | grep -q "cannot open"; do sleep 1; done
+                echo volume attached >> /var/log/volume-mount.log
+                # Format EBS if necessary
+                if file -s $DEVICE_NAME | grep -q "data$"
+                then
+                    mkfs -t $FS_FORMAT $DEVICE_NAME
+                fi
+                # Mount EBS
+                mkdir -p /mnt/config
+                mount $DEVICE_NAME $MOUNT_POINT
+                
+                echo volume mounted >> /var/log/volume-mount.log
+                # Ensure it's mounted on restart
+                cp /etc/fstab /etc/fstab.orig
+                echo "$DEVICE_NAME $MOUNT_POINT $FS_FORMAT defaults,nofail 0 2" >> /etc/fstab
+            03-update-dns:
+              command: !Sub
+                - |
+                  IP_ADDRESS=$(curl http://169.254.169.254/latest/meta-data/local-ipv4)
+                  aws route53 change-resource-record-sets --hosted-zone-id ${HostedZoneID} --change-batch "{
+                    \"Changes\": [{
+                      \"Action\": \"UPSERT\",
+                      \"ResourceRecordSet\": {
+                        \"Name\": \"${AWS::StackName}-${AWS::Region}.${HostedZone}\",
+                        \"Type\": \"A\",
+                        \"TTL\": 300,
+                        \"ResourceRecords\": [
+                          {
+                          \"Value\": \"$IP_ADDRESS\"
+                          }
+                        ]
+                      }
+                    }]
+                  }"
+                - HostedZoneID:
+                    'Fn::ImportValue': !Sub "${DomainStackName}::HostedZoneID"
+                  HostedZone:
+                    'Fn::ImportValue': !Sub '${DomainStackName}::HostedZone'
+
+            04-config-dirs:
+              command: !Sub |
+                for app in ssh aws
+                do
+                  if [ ! -d /mnt/config/$app ]
+                  then
+                    mkdir /mnt/config/$app
+                    cp -r /home/ec2-user/.$app/* /mnt/config/$app/
+                    chown -R ec2-user:ec2-user /mnt/config/$app
+                  fi
+                  rm -rf /home/ec2-user/.$app
+                  ln -s /mnt/config/$app /home/ec2-user/.$app
+                done
+                chown -R ec2-user:ec2-user /home/ec2-user
+                mkdir -p /mnt/config/git
+                chown ec2-user:ec2-user /mnt/config/git
+            05-config-profile:
+              command: !Sub |
+                echo '
+                # Automated configuration from control-server.yaml
+                PATH="/mnt/config/git/aws-devops:$PATH"
+                export AWS_DEFAULT_REGION=${AWS::Region}
+                ' >> /home/ec2-user/.bash_profile
+            06-install-git:
+              command: !Sub |
+                yum install -y git
+            07-install-python:
+              command: !Sub |
+                yum install -y python3
+                pip3 install "PyYAML==5.3.1"
+            08-install-install-program:
+              command: !Sub |
+                curl -LOs https://s3.amazonaws.com/donorschoose-docker-assets/install-program.sh
+                chmod +x ./install-program.sh
+            09-install-kubectl:
+              command: !Sub |
+                ./install-program.sh kubectl 1.21.2
+            10-remove-install-program:
+              command: !Sub |
+                rm ./install-program.sh
+            11-configure-kubectl:
+              command: !Sub |
+                sudo -i -u ec2-user aws eks update-kubeconfig --name ${EksName}
+            12-kubectl-autocomplete:
+              command: !Sub |
+                # It might be ideal to build this into the base AMI
+                yum install -y bash-completion
+                kubectl completion bash >/etc/bash_completion.d/kubectl
+            13-customize-prompt:
+              command: !Sub
+                - |
+                  if [[ ${AccountName} == dctest ]]
+                  then
+                      color='32'  # green
+                  elif [[ ${AccountName} == dcprod ]]
+                  then
+                      color='31'  # red
+                  else
+                      echo "Invalid account ${AccountName}!!!"
+                      color='31'  # red
+                  fi
+  
+                  color_on="\[\033[01;${!color}m\]"
+                  color_off='\[\033[0m\]'
+                  echo "export PS1=\"[${!color_on}${AccountName}${!color_off}-${ServerType}-server]$ \"" >> /home/ec2-user/.bashrc
+  
+                - AccountName:
+                    'Fn::ImportValue': !Sub '${DomainStackName}::Account-Name'
+
+            # docker is deprecated as a k8s runtime now, so they don't start it by default
+            12-start-docker:
+              command: !Sub |
+                systemctl start docker
+                systemctl enable docker
+        connect:
+          files:
+            "/etc/systemd/system/amazon-ssm-agent.service.d/override.conf":
+              mode: "000644"
+              content: |
+                [Service]
+                Environment="PS1=[Run 'sudo su - ec2-user']$ "
+          # To pick up the above config change
+          commands:
+            setup:
+              command: !Sub |
+                systemctl daemon-reload
+                systemctl restart amazon-ssm-agent
+    Properties:
+      KeyName:               !Ref EC2KeyName
+      InstanceType:          !Ref InstanceType
+      ImageId:
+        !FindInMap [
+          EKSOptimizedAMIbyRegion,
+          !Ref "AWS::Region",
+          !Ref KubernetesAMIVersion
+        ]
+      AssociatePublicIpAddress: false
+      InstanceMonitoring:    false
+      IamInstanceProfile:
+        'Fn::ImportValue': !If [IsControl, !Sub '${ProfilesStackName}::ci-profile', !Sub '${ProfilesStackName}::deploy-profile']
+      SecurityGroups:
+        - 'Fn::ImportValue': !Sub '${NetworkStackName}::Default-SG'
+      BlockDeviceMappings:
+        # The VolumeSize must be >= the snapshot used to create the AMI.
+        - DeviceName: "/dev/xvda" #root device
+          Ebs:
+            VolumeSize: 100
+            DeleteOnTermination: "true"
+
+      UserData:
+        # Becomes /var/lib/cloud/instance/user-data.txt script, which is run
+        # exactly once on the initial boot of each EC2 instance.
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            exec 1> >(tee -a /var/log/userdata.out) 2>&1
+            echo ============================================================
+            echo "START UserData at $(date)"
+            echo "Stack:                   ${AWS::StackName}"
+            echo "Base AMI:                ${BaseImageId}"
+            echo ============================================================
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource EC2forControl -c general
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource EC2forControl -c session-manager
+            echo
+            echo ============================================================
+            echo "DONE UserData at $(date)"
+            echo "Stack:                   ${AWS::StackName}"
+            echo "Base AMI:                ${BaseImageId}"
+            echo ============================================================
+          - BaseImageId:
+              !FindInMap [
+                EKSOptimizedAMIbyRegion,
+                !Ref "AWS::Region",
+                !Ref KubernetesAMIVersion
+              ]
+
+
+  ASGforControl:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      # Control EC2 rolling updates whenever the Auto Scaling group's
+      # launch configuration or subnet group membership is changed.
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT0S
+    Properties:
+      AvailabilityZones:
+        - !Select [0,
+            !Split [',',
+              "Fn::ImportValue": !Sub "${NetworkStackName}::Availability-Zones"]]
+      VPCZoneIdentifier:
+        - !Select [0,
+            !Split [',',
+              "Fn::ImportValue": !Sub "${NetworkStackName}::Private-Subnets"]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+          PropagateAtLaunch: true
+        - Key: ServerType
+          Value: !Ref ServerType
+          PropagateAtLaunch: true
+      DesiredCapacity: 1
+      MinSize: 0
+      MaxSize: 1
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: !Ref HealthCheckGracePeriod
+      LaunchConfigurationName: !Ref EC2forControl
+      MetricsCollection:
+        - Granularity: 1Minute
