@@ -185,7 +185,7 @@ Resources:
                 pip3 install "PyYAML==5.3.1"
             08-install-install-program:
               command: !Sub |
-                curl -LOs https://s3.amazonaws.com/donorschoose-docker-assets/install-program.sh
+                curl -LOs https://s3.amazonaws.com/anycompany-docker-assets/install-program.sh
                 chmod +x ./install-program.sh
             09-install-kubectl:
               command: !Sub |
